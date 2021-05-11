@@ -126,7 +126,7 @@ impl<T> FixedQueue<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc};
+    use std::sync::Arc;
     use std::thread;
 
     #[test]
