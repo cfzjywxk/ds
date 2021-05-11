@@ -125,7 +125,8 @@ impl<T> FixedQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc};
     use std::thread;
 
     #[test]
@@ -163,9 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_concurrent_push() {
-        let nthreads = 50;
-        let queue = Arc::new(FixedQueue::<usize>::new(500));
+    fn test_basic_concurrent() {
+        let nthreads = 10;
+        let queue = Arc::new(FixedQueue::<usize>::new(1000));
 
         let push_sum = Arc::new(AtomicUsize::new(0));
         let mut children = vec![];
@@ -173,8 +174,7 @@ mod tests {
             let sum_val = push_sum.clone();
             let push_queue = queue.clone();
             children.push(thread::spawn(move || {
-                println!("thread={:?} is starting to push", i);
-                for j in (i * 10)..((i + 1) * 10) {
+                for j in (i * 100)..((i + 1) * 100) {
                     loop {
                         if let Ok(_) = push_queue.push(j) {
                             sum_val.fetch_add(j as usize, Relaxed);
@@ -186,23 +186,43 @@ mod tests {
         }
 
         for child in children {
-            // Wait for the thread to finish. Returns a result.
             let _ = child.join();
         }
 
-        let mut actual_sum: usize = 0;
-        loop {
-            if let Ok(res) = queue.pop() {
-                actual_sum += res as usize;
-                continue;
-            }
-            break;
+        let start = Arc::new(AtomicBool::new(false));
+        children = vec![];
+        let actual_sum = Arc::new(AtomicUsize::new(0));
+        for i in 0..nthreads {
+            let actual_sum_val = actual_sum.clone();
+            let pop_queue = queue.clone();
+            let let_start = start.clone();
+            children.push(thread::spawn(move || {
+                loop {
+                    if let_start.load(Relaxed) {
+                        break;
+                    }
+                }
+                for _ in (i * 100)..((i + 1) * 100) {
+                    loop {
+                        if let Ok(res) = pop_queue.pop() {
+                            println!("the pop out value={:?} from thread={:?}", res, i);
+                            actual_sum_val.fetch_add(res as usize, Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+
+        start.store(true, Relaxed);
+        for child in children {
+            let _ = child.join();
         }
         println!(
             "the expected push_sum={:?}, the actual_sum={:?}",
             push_sum.load(Relaxed),
             actual_sum
         );
-        assert_eq!(push_sum.load(Relaxed), actual_sum)
+        assert_eq!(push_sum.load(Relaxed), actual_sum.load(Relaxed));
     }
 }
