@@ -122,6 +122,22 @@ impl<T> FixedQueue<T> {
     }
 }
 
+impl<T> Drop for FixedQueue<T> {
+    fn drop(&mut self) {
+        loop {
+            if let Ok(node) = self.pop() {
+                drop(node);
+            } else {
+                break;
+            }
+        }
+        unsafe {
+            // Do deallocate the buffer, but don't run any destructors.
+            Vec::from_raw_parts(self.buffer, 0, self.cap);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +240,60 @@ mod tests {
             actual_sum
         );
         assert_eq!(push_sum.load(Relaxed), actual_sum.load(Relaxed));
+    }
+
+    #[test]
+    fn test_drop() {
+        let mut node_drop_cnt = 0;
+        #[allow(dead_code)]
+        #[derive(Clone, Debug)]
+        struct LocalNode {
+            val: String,
+            cnt: *mut i32,
+        };
+
+        impl Drop for LocalNode {
+            fn drop(&mut self) {
+                unsafe {
+                    *self.cnt += 1;
+                }
+            }
+        }
+
+        impl LocalNode {
+            fn new(data: &str, cnt: *mut i32) -> Self {
+                LocalNode {
+                    val: String::from(data),
+                    cnt,
+                }
+            }
+        }
+
+        // Generate nodes.
+        let node1 = LocalNode::new("node1", &mut node_drop_cnt as *mut i32);
+        let node2 = LocalNode::new("node2", &mut node_drop_cnt as *mut i32);
+        let node3 = LocalNode::new("node3", &mut node_drop_cnt as *mut i32);
+
+        let queue = FixedQueue::<LocalNode>::new(1024);
+        assert!(queue.push(node1).is_ok());
+        assert!(queue.push(node2).is_ok());
+        assert!(queue.push(node3).is_ok());
+
+        // Popout node.
+        {
+            let _popout_node = queue.pop().unwrap();
+        }
+        assert_eq!(node_drop_cnt, 1);
+
+        let popout_node2 = queue.pop().unwrap();
+        // Move the queue.
+        {
+            let _moved_queue = queue;
+        }
+        assert_eq!(node_drop_cnt, 2);
+        {
+            let _drop_node2 = popout_node2;
+        }
+        assert_eq!(node_drop_cnt, 3);
     }
 }
