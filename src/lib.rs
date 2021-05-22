@@ -6,11 +6,15 @@ use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 #[derive(Debug, Clone, PartialOrd, PartialEq)]
 pub struct LocalError(String);
 
+/// A Node in the queue.
+/// The `value` field points to the underlying user value.
+/// The seq number is the producer sequence value, MAX means it's empty and invalid.
 struct Node<T> {
     value: UnsafeCell<T>,
     seq: usize,
 }
 
+/// A thread safe lock free queue with fixed capacities.
 pub struct FixedQueue<T> {
     // The capacity of the queue.
     cap: usize,
@@ -32,6 +36,7 @@ unsafe impl<T: Send> Sync for FixedQueue<T> {}
 unsafe impl<T: Send> Send for FixedQueue<T> {}
 
 impl<T> FixedQueue<T> {
+    /// Create a new queue with fixed buffer size.
     pub fn new(cap: usize) -> Self {
         assert!(cap > 0, "capacity must be non-zero");
 
@@ -56,6 +61,10 @@ impl<T> FixedQueue<T> {
         }
     }
 
+    /// Attempts to push an element into the queue.
+    ///
+    /// If the queue is full, the element is returned back as an error.
+    ///
     pub fn push(&self, data: T) -> Result<(), LocalError> {
         let mut old_pos = self.producer.load(Relaxed);
         let mut cmp_pos = old_pos;
@@ -90,6 +99,10 @@ impl<T> FixedQueue<T> {
         }
     }
 
+    /// Attempts to pop an element from the queue.
+    ///
+    /// If the queue is empty, the element is returned back as an error.
+    ///
     pub fn pop(&self) -> Result<T, LocalError> {
         let mut old_pos = self.consumer.load(Relaxed);
         let mut cmp_pos = old_pos;
@@ -123,6 +136,7 @@ impl<T> FixedQueue<T> {
 }
 
 impl<T> Drop for FixedQueue<T> {
+    /// Drop trait implementation for the queue, the left value and buffer will be freed.
     fn drop(&mut self) {
         loop {
             if let Ok(node) = self.pop() {
