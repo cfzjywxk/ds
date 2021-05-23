@@ -4,10 +4,10 @@ const NULL_ADDR: MemDBArenaAddr = MemDBArenaAddr {
     idx: u32::MAX,
     off: u32::MAX,
 };
-const ALIGN_MASK: i32 = 1 << 32 - 8; // 29 bit 1 and 3 bit 0.
-const NULL_BLOCK_OFFSET: i32 = i32::MAX;
-const MAX_BLOCK_SIZE: i32 = 128 << 20;
-const INIT_BLOCK_SIZE: i32 = 4 * 1024;
+const ALIGN_MASK: usize = ((1 << 32) - 8); // 29 bit 1 and 3 bit 0.
+const NULL_BLOCK_OFFSET: usize = i32::MAX as usize;
+const MAX_BLOCK_SIZE: usize = 128 << 20;
+const INIT_BLOCK_SIZE: usize = 4 * 1024;
 
 type TheEndian = LittleEndian;
 
@@ -19,6 +19,13 @@ struct MemDBArenaAddr {
 }
 
 impl MemDBArenaAddr {
+    fn new() -> Self {
+        MemDBArenaAddr {
+            idx: u32::MAX,
+            off: u32::MAX,
+        }
+    }
+
     fn is_null(&self) -> bool {
         *self == NULL_ADDR
     }
@@ -72,18 +79,7 @@ impl MemDBArena {
             }
             self.block_size = self.block_size << 1;
         }
-        let new_block = MemDBArenaBlock {
-            membuf: MemBuf {
-                buf: unsafe {
-                    let mut v = Vec::<u8>::with_capacity(self.block_size);
-                    let ptr = v.as_mut_ptr();
-                    std::mem::forget(v);
-                    ptr
-                },
-                capacity: self.block_size,
-            },
-            length: 0,
-        };
+        let new_block = MemDBArenaBlock::new(self.block_size);
         self.blocks.push(new_block);
     }
 }
@@ -101,12 +97,28 @@ struct MemBuf {
 }
 
 impl MemDBArenaBlock {
+    /// Create a new MemDBArenaBlock with fixed capacity.
+    fn new(block_size: usize) -> Self {
+        MemDBArenaBlock {
+            membuf: MemBuf {
+                buf: unsafe {
+                    let mut v = Vec::<u8>::with_capacity(block_size);
+                    let ptr = v.as_mut_ptr();
+                    std::mem::forget(v);
+                    ptr
+                },
+                capacity: block_size,
+            },
+            length: 0,
+        }
+    }
+
     /// Try to allocate a buf for the given size in current block, if the space is not
-    /// enough, None will be returned.
+    /// enough, None will be returned. The offset and allocated result are returned.
     fn alloc(&mut self, size: usize, align: bool) -> (usize, Option<MemBuf>) {
         let mut offset = self.length;
         if align {
-            offset = ((self.length + 7) as i32 & ALIGN_MASK) as usize;
+            offset = ((self.length + 7) & ALIGN_MASK) as usize;
         }
         let new_len = offset + size;
         if new_len > self.membuf.capacity {
@@ -171,4 +183,67 @@ impl MemDB {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use std::borrow::Borrow;
+
+    #[test]
+    fn test_mem_addr() {
+        let mut mem_addr = MemDBArenaAddr::new();
+        assert!(mem_addr.is_null(), true);
+        mem_addr.idx = 1;
+        mem_addr.off = 2;
+        let mut buf = vec![0; 8];
+        mem_addr.store(buf.as_mut_slice());
+        let mut new_mem_addr = MemDBArenaAddr::new();
+        new_mem_addr.load(buf.as_slice());
+        assert_eq!(new_mem_addr.idx, 1);
+        assert_eq!(new_mem_addr.off, 2);
+    }
+
+    #[test]
+    fn test_mem_arena_block() {
+        let block_size = 128;
+        let mut mem_arena_block = MemDBArenaBlock::new(block_size);
+        assert_eq!(mem_arena_block.membuf.capacity, block_size);
+
+        // Test alloc.
+        let (offset, alloc_res) = mem_arena_block.alloc(15, true);
+        assert_eq!(offset, 0);
+        assert_eq!(mem_arena_block.length, 15);
+        let mem_addr = alloc_res.unwrap();
+        assert_eq!(mem_addr.capacity, 15);
+        assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf);
+        let (offset, alloc_res) = mem_arena_block.alloc(32, true);
+        assert_eq!(offset, 16);
+        assert_eq!(mem_arena_block.length, 48);
+        let mem_addr = alloc_res.unwrap();
+        assert_eq!(mem_addr.capacity, 32);
+        unsafe {
+            assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(16));
+        }
+        let (offset, alloc_res) = mem_arena_block.alloc(29, true);
+        assert_eq!(offset, 48);
+        assert_eq!(mem_arena_block.length, 77);
+        let mem_addr = alloc_res.unwrap();
+        assert_eq!(mem_addr.capacity, 29);
+        unsafe {
+            assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(48));
+        }
+
+        // No more space.
+        let (offset, alloc_res) = mem_arena_block.alloc(64, true);
+        assert_eq!(offset, NULL_BLOCK_OFFSET);
+        assert!(alloc_res.is_none());
+
+        // Alloc again.
+        let (offset, alloc_res) = mem_arena_block.alloc(5, true);
+        assert_eq!(offset, 80);
+        assert_eq!(mem_arena_block.length, 85);
+        let mem_addr = alloc_res.unwrap();
+        assert_eq!(mem_addr.capacity, 5);
+        unsafe {
+            assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(80));
+        }
+    }
+}
