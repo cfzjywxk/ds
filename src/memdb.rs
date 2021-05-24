@@ -41,50 +41,10 @@ impl MemDBArenaAddr {
     }
 }
 
-/// MemDBArena is a collection of MemDBArenaBlock.
-struct MemDBArena {
-    block_size: usize,
-    blocks: Vec<MemDBArenaBlock>,
-}
-
-impl MemDBArena {
-    /// Do the checkpoint for current memory usage status.
-    fn checkpoint(&self) -> MemDBCheckpoint {
-        let mut snap = MemDBCheckpoint {
-            block_size: self.block_size,
-            blocks: self.blocks.len(),
-            offset_in_block: 0,
-        };
-        if self.blocks.len() > 0 {
-            snap.offset_in_block = self.blocks.last().unwrap().length;
-        }
-        snap
-    }
-
-    /// Revert to snapshot memory usage status.
-    fn truncate(&mut self, snap: &MemDBCheckpoint) {
-        assert!(snap.blocks <= self.blocks.len());
-        self.blocks.truncate(snap.blocks);
-        if self.blocks.len() > 0 {
-            self.blocks.last_mut().unwrap().length = snap.offset_in_block;
-        }
-        self.block_size = snap.block_size;
-    }
-
-    fn enlarge(&mut self, allocate_size: usize, block_size: usize) {
-        self.block_size = block_size;
-        loop {
-            if self.block_size > allocate_size {
-                break;
-            }
-            self.block_size = self.block_size << 1;
-        }
-        let new_block = MemDBArenaBlock::new(self.block_size);
-        self.blocks.push(new_block);
-    }
-}
-
 /// MemDBArenaBlock is a memory block, the owned memory will be deallocated doing drop.
+/// The memory management strategy is, all the memory is allocated from a specific arena
+/// block and the user need not to deallocate the memory themselves, all the cleanup work
+/// will be done by the arena block.
 struct MemDBArenaBlock {
     membuf: MemBuf,
     length: usize,
@@ -160,6 +120,93 @@ impl MemDBCheckpoint {
     /// Checks if two checkpoints are in the same arena block.
     fn is_same_position(&self, other: &MemDBCheckpoint) -> bool {
         self.blocks == other.blocks && self.offset_in_block == other.offset_in_block
+    }
+}
+
+/// MemDBArena is a collection of MemDBArenaBlock.
+struct MemDBArena {
+    block_size: usize,
+    blocks: Vec<MemDBArenaBlock>,
+}
+
+impl MemDBArena {
+    /// Do the checkpoint for current memory usage status.
+    fn checkpoint(&self) -> MemDBCheckpoint {
+        let mut snap = MemDBCheckpoint {
+            block_size: self.block_size,
+            blocks: self.blocks.len(),
+            offset_in_block: 0,
+        };
+        if self.blocks.len() > 0 {
+            snap.offset_in_block = self.blocks.last().unwrap().length;
+        }
+        snap
+    }
+
+    /// Revert to the snapshot memory usage status.
+    fn truncate(&mut self, snap: &MemDBCheckpoint) {
+        assert!(snap.blocks <= self.blocks.len());
+        self.blocks.truncate(snap.blocks);
+        if self.blocks.len() > 0 {
+            self.blocks.last_mut().unwrap().length = snap.offset_in_block;
+        }
+        self.block_size = snap.block_size;
+    }
+
+    fn enlarge(&mut self, allocate_size: usize, block_size: usize) {
+        self.block_size = block_size;
+        loop {
+            if self.block_size > allocate_size {
+                break;
+            }
+            self.block_size = self.block_size << 1;
+        }
+        let new_block = MemDBArenaBlock::new(self.block_size);
+        self.blocks.push(new_block);
+    }
+}
+
+// bit 1 => red, bit 0 => black
+const NODE_COLOR_BIT: u8 = 0x80;
+const NODE_FLAGS_MASK: u8 = (!NODE_COLOR_BIT);
+
+/// MemDBNode is the tree node of the memory buffer.
+struct MemDBNode {
+    up: MemDBArenaAddr,
+    left: MemDBArenaAddr,
+    right: MemDBArenaAddr,
+    vptr: MemDBArenaAddr,
+    klen: u16,
+    flags: u8,
+    kptr: MemBuf,
+}
+
+impl MemDBNode {
+    /// Check if the node is marked red.
+    fn is_red(&self) -> bool {
+        (self.flags & NODE_COLOR_BIT) != 0
+    }
+
+    /// Check if the node is marked black.
+    fn is_black(&self) -> bool {
+        !self.is_red()
+    }
+
+    /// Mark the node red.
+    fn set_red(&mut self) {
+        self.flags |= NODE_COLOR_BIT;
+    }
+
+    /// Mark the node black.
+    fn set_black(&mut self) {
+        self.flags &= (!NODE_COLOR_BIT);
+    }
+
+    /// Return the key reference to the key.The underlying memory of the key node
+    /// is owned by the MemDBArenaBlock, so the MemDBNode is not responsible for
+    /// deallocating it.
+    fn get_key(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.kptr.buf, self.kptr.capacity) }
     }
 }
 
