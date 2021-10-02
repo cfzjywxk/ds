@@ -1,18 +1,29 @@
 use byteorder::{ByteOrder, LittleEndian};
+use std::borrow::{Borrow, BorrowMut};
+use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
+use std::rc::Rc;
 
 const NULL_ADDR: MemDBArenaAddr = MemDBArenaAddr {
     idx: u32::MAX,
     off: u32::MAX,
 };
-const ALIGN_MASK: usize = ((1 << 32) - 8); // 29 bit 1 and 3 bit 0.
+const ALIGN_MASK: usize = (1 << 32) - 8; // 29 bit 1 and 3 bit 0.
 const NULL_BLOCK_OFFSET: usize = i32::MAX as usize;
 const MAX_BLOCK_SIZE: usize = 128 << 20;
 const INIT_BLOCK_SIZE: usize = 4 * 1024;
+const MEMDB_VLOG_HDR_SIZE: usize = 8 + 8 + 4;
+
+// bit 1 => red, bit 0 => black
+const NODE_COLOR_BIT: u8 = 0x80;
+const NODE_FLAGS_MASK: u8 = !NODE_COLOR_BIT;
 
 type TheEndian = LittleEndian;
 
 /// MemDBArenaAddr is a memory address in a MemDBArena.
-#[derive(PartialOrd, PartialEq)]
+/// idx is the index for arena blocks.
+/// off is the offset within a specific block.
+#[derive(PartialOrd, PartialEq, Copy, Clone)]
 struct MemDBArenaAddr {
     idx: u32,
     off: u32,
@@ -30,11 +41,13 @@ impl MemDBArenaAddr {
         *self == NULL_ADDR
     }
 
+    /// store the information within the MemDBArenaAddr object into the dst.
     fn store(&self, dst: &mut [u8]) {
         TheEndian::write_u32(dst, self.idx);
         TheEndian::write_u32(&mut dst[4..], self.off);
     }
 
+    /// load the information from the src into the MemDBArenaAddr object.
     fn load(&mut self, src: &[u8]) {
         self.idx = TheEndian::read_u32(src);
         self.off = TheEndian::read_u32(&src[4..]);
@@ -56,12 +69,21 @@ struct MemBuf {
     capacity: usize,
 }
 
+impl MemBuf {
+    /// Do copy the value into the memory address.
+    fn copy_value(&mut self, value: &[u8]) {
+        unsafe {
+            self.buf.copy_from(value.as_ptr(), value.len());
+        }
+    }
+}
+
 impl MemDBArenaBlock {
     /// Create a new MemDBArenaBlock with fixed capacity.
     fn new(block_size: usize) -> Self {
         MemDBArenaBlock {
             membuf: MemBuf {
-                buf: unsafe {
+                buf: {
                     let mut v = Vec::<u8>::with_capacity(block_size);
                     let ptr = v.as_mut_ptr();
                     std::mem::forget(v);
@@ -117,6 +139,13 @@ struct MemDBCheckpoint {
 }
 
 impl MemDBCheckpoint {
+    fn new(block_size: usize, blocks: usize) -> Self {
+        MemDBCheckpoint {
+            block_size,
+            blocks,
+            offset_in_block: 0,
+        }
+    }
     /// Checks if two checkpoints are in the same arena block.
     fn is_same_position(&self, other: &MemDBCheckpoint) -> bool {
         self.blocks == other.blocks && self.offset_in_block == other.offset_in_block
@@ -130,6 +159,43 @@ struct MemDBArena {
 }
 
 impl MemDBArena {
+    fn new() -> Self {
+        MemDBArena {
+            block_size: 0,
+            blocks: vec![],
+        }
+    }
+    fn alloc_in_last_block(
+        &mut self,
+        size: usize,
+        align: bool,
+    ) -> (MemDBArenaAddr, Option<MemBuf>) {
+        let idx = self.blocks.len() - 1;
+        let (offset, data) = self.blocks[idx].alloc(size, align);
+        if offset == NULL_BLOCK_OFFSET {
+            return (NULL_ADDR, None);
+        }
+        (
+            MemDBArenaAddr {
+                idx: idx as u32,
+                off: offset as u32,
+            },
+            data,
+        )
+    }
+
+    fn alloc(&mut self, size: usize, align: bool) -> (MemDBArenaAddr, Option<MemBuf>) {
+        if self.blocks.len() == 0 {
+            self.enlarge(size, INIT_BLOCK_SIZE);
+        }
+        let (addr, data) = self.alloc_in_last_block(size, align);
+        if !addr.is_null() {
+            return (addr, data);
+        }
+        self.enlarge(size, self.block_size << 1);
+        self.alloc_in_last_block(size, align)
+    }
+
     /// Do the checkpoint for current memory usage status.
     fn checkpoint(&self) -> MemDBCheckpoint {
         let mut snap = MemDBCheckpoint {
@@ -166,10 +232,6 @@ impl MemDBArena {
     }
 }
 
-// bit 1 => red, bit 0 => black
-const NODE_COLOR_BIT: u8 = 0x80;
-const NODE_FLAGS_MASK: u8 = (!NODE_COLOR_BIT);
-
 /// MemDBNode is the tree node of the memory buffer.
 struct MemDBNode {
     up: MemDBArenaAddr,
@@ -178,10 +240,21 @@ struct MemDBNode {
     vptr: MemDBArenaAddr,
     klen: u16,
     flags: u8,
-    kptr: MemBuf,
+    kptr: Option<MemBuf>,
 }
 
 impl MemDBNode {
+    fn new() -> Self {
+        MemDBNode {
+            up: NULL_ADDR,
+            left: NULL_ADDR,
+            right: NULL_ADDR,
+            vptr: NULL_ADDR,
+            klen: 0,
+            flags: 0,
+            kptr: None,
+        }
+    }
     /// Check if the node is marked red.
     fn is_red(&self) -> bool {
         (self.flags & NODE_COLOR_BIT) != 0
@@ -199,33 +272,342 @@ impl MemDBNode {
 
     /// Mark the node black.
     fn set_black(&mut self) {
-        self.flags &= (!NODE_COLOR_BIT);
+        self.flags &= !NODE_COLOR_BIT;
     }
 
     /// Return the key reference to the key.The underlying memory of the key node
     /// is owned by the MemDBArenaBlock, so the MemDBNode is not responsible for
     /// deallocating it.
     fn get_key(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.kptr.buf, self.kptr.capacity) }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.kptr.as_ref().unwrap().buf,
+                self.kptr.as_ref().unwrap().capacity,
+            )
+        }
     }
 }
 
+struct MemDBNodeAddr {
+    node: *mut MemDBNode,
+    addr: MemDBArenaAddr,
+}
+
+impl MemDBNodeAddr {
+    fn new(node: *mut MemDBNode, addr: MemDBArenaAddr) -> Self {
+        MemDBNodeAddr { node, addr }
+    }
+
+    fn is_null(&self) -> bool {
+        self.addr.is_null()
+    }
+
+    fn get_up(&self, db: &mut MemDB) -> MemDBNodeAddr {
+        unsafe { db.get_node((*self.node).up) }
+    }
+
+    fn get_left(&self, db: &mut MemDB) -> MemDBNodeAddr {
+        unsafe { db.get_node((*self.node).left) }
+    }
+
+    fn get_right(&self, db: &mut MemDB) -> MemDBNodeAddr {
+        unsafe { db.get_node((*self.node).right) }
+    }
+}
+
+struct MemDBVlog {
+    mem_arena: MemDBArena,
+}
+
+impl MemDBVlog {
+    fn new() -> Self {
+        MemDBVlog {
+            mem_arena: MemDBArena::new(),
+        }
+    }
+
+    /// Append a value into the memory db value log, the new value will have pointer to the node
+    /// itself and the old or previous value.
+    fn append_value(
+        &mut self,
+        node_addr: MemDBArenaAddr,
+        old_value: MemDBArenaAddr,
+        value: &[u8],
+    ) -> MemDBArenaAddr {
+        let size = MEMDB_VLOG_HDR_SIZE + value.len();
+        let (mut addr, mem) = self.mem_arena.alloc(size, false);
+        let mut membuf = mem.unwrap();
+        membuf.copy_value(value);
+        let mem_vlog_header = MemDBVlogHdr {
+            node_addr,
+            old_value,
+            value_len: value.len() as u32,
+        };
+        unsafe {
+            let slice_buf = std::slice::from_raw_parts_mut(
+                membuf.buf.add(value.len()),
+                membuf.capacity - value.len(),
+            );
+            mem_vlog_header.store(slice_buf);
+        }
+        addr.off += size as u32;
+        addr
+    }
+
+    fn get_value(&self, addr: MemDBArenaAddr) -> Option<&[u8]> {
+        let len_off = addr.off as usize - MEMDB_VLOG_HDR_SIZE;
+        let block: &MemDBArenaBlock = self.mem_arena.blocks.get(addr.idx as usize).unwrap();
+        let dst_slice = unsafe {
+            std::slice::from_raw_parts(block.membuf.buf.add(len_off as usize), len_off as usize)
+        };
+        let value_len = TheEndian::read_u32(dst_slice) as usize;
+        if value_len == 0 {
+            return None;
+        }
+        let value_off = len_off - value_len;
+        unsafe {
+            Some(std::slice::from_raw_parts(
+                block.membuf.buf.add(value_off as usize),
+                value_off as usize,
+            ))
+        }
+    }
+
+    fn can_modify(cp: &Option<MemDBCheckpoint>, addr: MemDBArenaAddr) -> bool {
+        if cp.is_none() {
+            return true;
+        }
+        let check_point = cp.as_ref().unwrap();
+        if addr.idx > (check_point.blocks - 1) as u32 {
+            return true;
+        }
+        if addr.idx == (check_point.blocks - 1) as u32
+            && addr.off > check_point.offset_in_block as u32
+        {
+            return true;
+        }
+        false
+    }
+
+    fn get_snapshot_value(
+        &self,
+        addr: MemDBArenaAddr,
+        snap: &Option<MemDBCheckpoint>,
+    ) -> (Option<&[u8]>, bool) {
+        let addr_res =
+            self.select_value_history(addr, |the_addr| MemDBVlog::can_modify(snap, addr));
+        if addr_res.is_none() {
+            return (None, false);
+        }
+        (self.get_value(addr_res.unwrap()), true)
+    }
+
+    fn select_value_history<F: Fn(&MemDBArenaAddr) -> bool>(
+        &self,
+        addr: MemDBArenaAddr,
+        predicate: F,
+    ) -> Option<MemDBArenaAddr> {
+        let mut addr_res = addr;
+        while !addr_res.is_null() {
+            if predicate(&addr_res) {
+                return Some(addr_res);
+            }
+            let mut hdr = MemDBVlogHdr::new();
+            let src_addr = unsafe {
+                let block: &MemDBArenaBlock =
+                    self.mem_arena.blocks.get(addr_res.idx as usize).unwrap();
+                std::slice::from_raw_parts(
+                    block
+                        .membuf
+                        .buf
+                        .add((addr_res.off - MEMDB_VLOG_HDR_SIZE as u32) as usize),
+                    MEMDB_VLOG_HDR_SIZE,
+                )
+            };
+            hdr.load(src_addr);
+            addr_res = hdr.old_value;
+        }
+        None
+    }
+
+    fn checkpoint(&mut self) -> MemDBCheckpoint {
+        self.mem_arena.checkpoint()
+    }
+
+    /// TODO.
+    fn revert_to_checkpoint(&mut self, db: &mut MemDB, cp: &MemDBCheckpoint) {
+        let cursor = self.checkpoint();
+        while !cp.is_same_position(&cursor) {
+            let hdr_off = cursor.offset_in_block - MEMDB_VLOG_HDR_SIZE;
+            let block = self.mem_arena.blocks.get(cursor.blocks - 1).unwrap();
+            let mut hdr = MemDBVlogHdr::new();
+            unsafe {
+                hdr.load(core::slice::from_raw_parts(
+                    block.membuf.buf.add(hdr_off),
+                    MEMDB_VLOG_HDR_SIZE,
+                ));
+            }
+        }
+    }
+
+    /// TODO.
+    fn inspect_kv_in_log<F: Fn(&[u8], &[u8])>(
+        &self,
+        db: &mut MemDB,
+        head: &MemDBCheckpoint,
+        tail: &MemDBCheckpoint,
+        f: F,
+    ) {
+    }
+}
+
+struct MemDBVlogHdr {
+    node_addr: MemDBArenaAddr,
+    old_value: MemDBArenaAddr,
+    value_len: u32,
+}
+impl MemDBVlogHdr {
+    fn new() -> MemDBVlogHdr {
+        MemDBVlogHdr {
+            node_addr: MemDBArenaAddr { idx: 0, off: 0 },
+            old_value: MemDBArenaAddr { idx: 0, off: 0 },
+            value_len: 0,
+        }
+    }
+
+    fn store(&self, dst: &mut [u8]) {
+        let mut cursor = 0;
+        TheEndian::write_u32(&mut dst[cursor..], self.value_len);
+        cursor += 4;
+        self.old_value.store(&mut dst[cursor..]);
+        cursor += 4;
+        self.node_addr.store(&mut dst[cursor..]);
+    }
+
+    fn load(&mut self, src: &[u8]) {
+        let mut cursor = 0;
+        self.value_len = TheEndian::read_u32(&src[cursor..]);
+        cursor += 4;
+        self.old_value.load(&src[cursor..]);
+        cursor += 8;
+        self.node_addr.load(&src[cursor..]);
+    }
+}
+
+struct NodeAllocator {
+    mem_arena: MemDBArena,
+
+    // Dummy node, so that we can make X.left.up = X.
+    // We then use this instead of NULL to mean the top or bottom
+    // end of the rb tree. It is a black node.
+    null_node: MemDBNode,
+}
+
+impl NodeAllocator {
+    fn new() -> Self {
+        NodeAllocator {
+            mem_arena: MemDBArena::new(),
+            null_node: MemDBNode::new(),
+        }
+    }
+
+    fn get_node(&mut self, addr: MemDBArenaAddr) -> *mut MemDBNode {
+        if addr.is_null() {
+            let raw_ptr: *mut MemDBNode = &mut self.null_node;
+            return raw_ptr;
+        }
+        let block: &MemDBArenaBlock = self.mem_arena.blocks.get(addr.idx as usize).unwrap();
+        unsafe {
+            block.membuf.buf.add(addr.off as usize) as *mut MemDBNode
+        }
+    }
+}
+
+/// MemDB is rollbackable Red-Black Tree optimized for TiDB's transaction states buffer use scenario.
+/// You can think MemDB is a combination of two separate tree map, one for key => value and another for key => keyFlags.
+///
+/// The value map is rollbackable, that means you can use the `Staging`, `Release` and `Cleanup` API to safely modify KVs.
+///
+/// The flags map is not rollbackable. There are two types of flag, persistent and non-persistent.
+/// When discarding a newly added KV in `Cleanup`, the non-persistent flags will be cleared.
+/// If there are persistent flags associated with key, we will keep this key in node without value.
 pub struct MemDB {
+    lock: std::sync::Mutex<i8>,
+    root: MemDBArenaAddr,
+    allocator: NodeAllocator,
+    vlog: MemDBVlog,
+
     count: i32,
     size: i32,
     vlog_invalid: bool,
     dirty: bool,
+    stages: Vec<MemDBCheckpoint>,
 }
 
 impl MemDB {
     /// Create a new MemDB object.
     pub fn new() -> Self {
         MemDB {
+            lock: std::sync::Mutex::new(1),
+            root: MemDBArenaAddr::new(),
+            allocator: NodeAllocator::new(),
+            vlog: MemDBVlog::new(),
             count: 0,
             size: 0,
             vlog_invalid: false,
             dirty: false,
+            stages: vec![],
         }
+    }
+
+    pub fn staging(&mut self) -> usize {
+        let _ = self.lock.lock();
+        self.stages.push(self.vlog.checkpoint());
+        self.stages.len()
+    }
+
+    pub fn release(&mut self, h: usize) {
+        if h != self.stages.len() {
+            // This should never happens in production environment.
+            // Use panic to make debug easier.
+            panic!("cannot release staging buffer");
+        }
+
+        self.lock.lock();
+        if h == 1 {
+            let tail = self.vlog.checkpoint();
+            if !self.stages[0].is_same_position(&tail) {
+                self.dirty = true;
+            }
+        }
+        self.stages.pop();
+    }
+    /// Cleanup cleanup the resources referenced by the StagingHandle.
+    /// If the changes are not published by `Release`, they will be discarded.
+    pub fn cleanup(&mut self, h: usize) {
+        if h > self.stages.len() {
+            return;
+        }
+        if h < self.stages.len() {
+            // This should never happens in production environment.
+            // Use panic to make debug easier.
+            panic!("cannot cleanup staging buffer");
+        }
+
+        self.lock.lock();
+        let cp = self.stages.get(h - 1).unwrap();
+        if !self.vlog_invalid {
+            let curr = self.vlog.checkpoint();
+            if !curr.is_same_position(cp) {
+                self.vlog.revert_to_checkpoint(self, cp);
+                self.vlog.mem_arena.truncate(cp);
+            }
+        }
+        self.stages.pop();
+    }
+
+    fn get_node(&mut self, x: MemDBArenaAddr) -> MemDBNodeAddr {
+        MemDBNodeAddr::new(self.allocator.get_node(x), x)
     }
 }
 
@@ -292,5 +674,11 @@ mod tests {
         unsafe {
             assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(80));
         }
+    }
+
+    #[test]
+    fn test_vlog_basic() {
+        let v = b"value";
+        let vlog = MemDBVlog::new();
     }
 }
