@@ -299,6 +299,13 @@ struct MemDBNodeAddr {
 }
 
 impl MemDBNodeAddr {
+    fn new_null() -> Self {
+        MemDBNodeAddr {
+            node: MemDBNode::new(),
+            addr: NULL_ADDR,
+        }
+    }
+
     fn new(node: MemDBNode, addr: MemDBArenaAddr) -> Self {
         MemDBNodeAddr { node, addr }
     }
@@ -317,6 +324,40 @@ impl MemDBNodeAddr {
 
     fn get_right(&self, db: &mut MemDB) -> MemDBNodeAddr {
         db.get_node(self.node.right)
+    }
+}
+
+struct MemDBVlogHdr {
+    node_addr: MemDBArenaAddr,
+    old_value: MemDBArenaAddr,
+    value_len: u32,
+}
+
+impl MemDBVlogHdr {
+    fn new() -> MemDBVlogHdr {
+        MemDBVlogHdr {
+            node_addr: MemDBArenaAddr { idx: 0, off: 0 },
+            old_value: MemDBArenaAddr { idx: 0, off: 0 },
+            value_len: 0,
+        }
+    }
+
+    fn store(&self, dst: &mut [u8]) {
+        let mut cursor = 0;
+        TheEndian::write_u32(&mut dst[cursor..], self.value_len);
+        cursor += 4;
+        self.old_value.store(&mut dst[cursor..]);
+        cursor += 4;
+        self.node_addr.store(&mut dst[cursor..]);
+    }
+
+    fn load(&mut self, src: &[u8]) {
+        let mut cursor = 0;
+        self.value_len = TheEndian::read_u32(&src[cursor..]);
+        cursor += 4;
+        self.old_value.load(&src[cursor..]);
+        cursor += 8;
+        self.node_addr.load(&src[cursor..]);
     }
 }
 
@@ -359,6 +400,7 @@ impl MemDBVlog {
         addr
     }
 
+    // Returns the value slice in the memory block.
     fn get_value(&self, addr: MemDBArenaAddr) -> Option<&[u8]> {
         let len_off = addr.off as usize - MEMDB_VLOG_HDR_SIZE;
         let block: &MemDBArenaBlock = self.mem_arena.blocks.get(addr.idx as usize).unwrap();
@@ -460,39 +502,6 @@ impl MemDBVlog {
     }
 }
 
-struct MemDBVlogHdr {
-    node_addr: MemDBArenaAddr,
-    old_value: MemDBArenaAddr,
-    value_len: u32,
-}
-impl MemDBVlogHdr {
-    fn new() -> MemDBVlogHdr {
-        MemDBVlogHdr {
-            node_addr: MemDBArenaAddr { idx: 0, off: 0 },
-            old_value: MemDBArenaAddr { idx: 0, off: 0 },
-            value_len: 0,
-        }
-    }
-
-    fn store(&self, dst: &mut [u8]) {
-        let mut cursor = 0;
-        TheEndian::write_u32(&mut dst[cursor..], self.value_len);
-        cursor += 4;
-        self.old_value.store(&mut dst[cursor..]);
-        cursor += 4;
-        self.node_addr.store(&mut dst[cursor..]);
-    }
-
-    fn load(&mut self, src: &[u8]) {
-        let mut cursor = 0;
-        self.value_len = TheEndian::read_u32(&src[cursor..]);
-        cursor += 4;
-        self.old_value.load(&src[cursor..]);
-        cursor += 8;
-        self.node_addr.load(&src[cursor..]);
-    }
-}
-
 struct NodeAllocator {
     mem_arena: MemDBArena,
 
@@ -510,14 +519,14 @@ impl NodeAllocator {
         }
     }
 
-    fn get_node(&mut self, addr: MemDBArenaAddr) -> MemDBNode {
+    fn get_node(&self, addr: MemDBArenaAddr) -> MemDBNode {
         if addr.is_null() {
             return MemDBNode::new();
         }
         let block: &MemDBArenaBlock = self.mem_arena.blocks.get(addr.idx as usize).unwrap();
         unsafe {
             let node_ptr = block.membuf.buf.add(addr.off as usize) as *const MemDBNode;
-            (*node_ptr)
+            *node_ptr
         }
     }
 }
@@ -581,6 +590,7 @@ impl MemDB {
         }
         self.stages.pop();
     }
+
     /// Cleanup cleanup the resources referenced by the StagingHandle.
     /// If the changes are not published by `Release`, they will be discarded.
     pub fn cleanup(&mut self, h: usize) {
@@ -605,7 +615,8 @@ impl MemDB {
         self.stages.pop();
     }
 
-    fn get_node(&mut self, x: MemDBArenaAddr) -> MemDBNodeAddr {
+    /// Return the address for the underlying node.
+    fn get_node(&self, x: MemDBArenaAddr) -> MemDBNodeAddr {
         MemDBNodeAddr::new(self.allocator.get_node(x), x)
     }
 
@@ -643,6 +654,42 @@ impl MemDB {
             self.vlog.mem_arena.blocks.last_mut().unwrap().length = snap.offset_in_block;
         }
         self.vlog.mem_arena.block_size = snap.block_size;
+    }
+
+    /// The main entrance for the rea-block tree get and set.
+    fn traverse(&mut self, key: &[u8], insert: bool) -> MemDBNodeAddr {
+        let res_addr = MemDBNodeAddr::new_null();
+        return res_addr;
+    }
+
+    fn set_value(&mut self, x: MemDBNodeAddr, value: &[u8]) {}
+
+    fn set(&mut self, key: &[u8], value: &[u8]) -> Result<usize, &'static str> {
+        if self.vlog_invalid {
+            panic!("value log is invalid");
+        }
+
+        if self.stages.len() == 0 {
+            self.dirty = true;
+        }
+        let x = self.traverse(key, true);
+        if value.len() == 0 {
+            return Ok(0);
+        }
+
+        self.set_value(x, value);
+        Ok(value.len())
+    }
+
+    /**
+    The public interface implementations.
+    **/
+    /// Set key and value into the memdb.
+    pub fn Set(&mut self, key: &[u8], value: &[u8]) -> Result<usize, &'static str> {
+        if key.len() == 0 || value.len() == 0 {
+            return Err("unexpected key/value input with zero len");
+        }
+        self.set(key, value)
     }
 }
 
