@@ -2,7 +2,6 @@ use byteorder::{ByteOrder, LittleEndian};
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
-use std::rc::Rc;
 
 const NULL_ADDR: MemDBArenaAddr = MemDBArenaAddr {
     idx: u32::MAX,
@@ -66,7 +65,7 @@ struct MemDBArenaBlock {
 /// MemBuf is a mark for a memory like vector.
 struct MemBuf {
     buf: *mut u8,
-    capacity: usize,
+    len: usize,
 }
 
 impl MemBuf {
@@ -89,7 +88,7 @@ impl MemDBArenaBlock {
                     std::mem::forget(v);
                     ptr
                 },
-                capacity: block_size,
+                len: block_size,
             },
             length: 0,
         }
@@ -103,14 +102,14 @@ impl MemDBArenaBlock {
             offset = ((self.length + 7) & ALIGN_MASK) as usize;
         }
         let new_len = offset + size;
-        if new_len > self.membuf.capacity {
+        if new_len > self.membuf.len {
             return (NULL_BLOCK_OFFSET as usize, None);
         }
         self.length = new_len;
         let buf = unsafe {
             MemBuf {
                 buf: self.membuf.buf.add(offset as usize),
-                capacity: size,
+                len: size,
             }
         };
         (offset, Some(buf))
@@ -124,14 +123,15 @@ impl Drop for MemDBArenaBlock {
             // Create a slice from the buffer to make
             // a fat pointer. Then, use Box::from_raw
             // to deallocate it.
-            let ptr = core::slice::from_raw_parts_mut(self.membuf.buf, self.membuf.capacity)
-                as *mut [u8];
+            let ptr =
+                core::slice::from_raw_parts_mut(self.membuf.buf, self.membuf.len) as *mut [u8];
             Box::from_raw(ptr);
         }
     }
 }
 
 /// A checkpoint recording the memory status.
+#[derive(Copy, Clone)]
 struct MemDBCheckpoint {
     block_size: usize,
     blocks: usize,
@@ -185,6 +185,9 @@ impl MemDBArena {
     }
 
     fn alloc(&mut self, size: usize, align: bool) -> (MemDBArenaAddr, Option<MemBuf>) {
+        if size > MAX_BLOCK_SIZE {
+            panic!("allocate size is greater than the maximum size");
+        }
         if self.blocks.len() == 0 {
             self.enlarge(size, INIT_BLOCK_SIZE);
         }
@@ -227,12 +230,17 @@ impl MemDBArena {
             }
             self.block_size = self.block_size << 1;
         }
+        // Size will never be larger than maxBlockSize.
+        if self.block_size > MAX_BLOCK_SIZE {
+            self.block_size = MAX_BLOCK_SIZE
+        }
         let new_block = MemDBArenaBlock::new(self.block_size);
         self.blocks.push(new_block);
     }
 }
 
-/// MemDBNode is the tree node of the memory buffer.
+/// MemDBNode is the tree node in the memdb.
+#[derive(Clone, Copy)]
 struct MemDBNode {
     up: MemDBArenaAddr,
     left: MemDBArenaAddr,
@@ -240,7 +248,6 @@ struct MemDBNode {
     vptr: MemDBArenaAddr,
     klen: u16,
     flags: u8,
-    kptr: Option<MemBuf>,
 }
 
 impl MemDBNode {
@@ -252,7 +259,6 @@ impl MemDBNode {
             vptr: NULL_ADDR,
             klen: 0,
             flags: 0,
-            kptr: None,
         }
     }
     /// Check if the node is marked red.
@@ -278,23 +284,22 @@ impl MemDBNode {
     /// Return the key reference to the key.The underlying memory of the key node
     /// is owned by the MemDBArenaBlock, so the MemDBNode is not responsible for
     /// deallocating it.
-    fn get_key(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                self.kptr.as_ref().unwrap().buf,
-                self.kptr.as_ref().unwrap().capacity,
-            )
+    fn get_key(&mut self) -> MemBuf {
+        let flag_ptr: *mut u8 = &mut self.flags;
+        MemBuf {
+            buf: unsafe { flag_ptr.add(1) },
+            len: self.klen as usize,
         }
     }
 }
 
 struct MemDBNodeAddr {
-    node: *mut MemDBNode,
+    node: MemDBNode,
     addr: MemDBArenaAddr,
 }
 
 impl MemDBNodeAddr {
-    fn new(node: *mut MemDBNode, addr: MemDBArenaAddr) -> Self {
+    fn new(node: MemDBNode, addr: MemDBArenaAddr) -> Self {
         MemDBNodeAddr { node, addr }
     }
 
@@ -303,15 +308,15 @@ impl MemDBNodeAddr {
     }
 
     fn get_up(&self, db: &mut MemDB) -> MemDBNodeAddr {
-        unsafe { db.get_node((*self.node).up) }
+        db.get_node(self.node.up)
     }
 
     fn get_left(&self, db: &mut MemDB) -> MemDBNodeAddr {
-        unsafe { db.get_node((*self.node).left) }
+        db.get_node(self.node.left)
     }
 
     fn get_right(&self, db: &mut MemDB) -> MemDBNodeAddr {
-        unsafe { db.get_node((*self.node).right) }
+        db.get_node(self.node.right)
     }
 }
 
@@ -346,7 +351,7 @@ impl MemDBVlog {
         unsafe {
             let slice_buf = std::slice::from_raw_parts_mut(
                 membuf.buf.add(value.len()),
-                membuf.capacity - value.len(),
+                membuf.len - value.len(),
             );
             mem_vlog_header.store(slice_buf);
         }
@@ -435,22 +440,6 @@ impl MemDBVlog {
     }
 
     /// TODO.
-    fn revert_to_checkpoint(&mut self, db: &mut MemDB, cp: &MemDBCheckpoint) {
-        let cursor = self.checkpoint();
-        while !cp.is_same_position(&cursor) {
-            let hdr_off = cursor.offset_in_block - MEMDB_VLOG_HDR_SIZE;
-            let block = self.mem_arena.blocks.get(cursor.blocks - 1).unwrap();
-            let mut hdr = MemDBVlogHdr::new();
-            unsafe {
-                hdr.load(core::slice::from_raw_parts(
-                    block.membuf.buf.add(hdr_off),
-                    MEMDB_VLOG_HDR_SIZE,
-                ));
-            }
-        }
-    }
-
-    /// TODO.
     fn inspect_kv_in_log<F: Fn(&[u8], &[u8])>(
         &self,
         db: &mut MemDB,
@@ -458,6 +447,16 @@ impl MemDBVlog {
         tail: &MemDBCheckpoint,
         f: F,
     ) {
+    }
+
+    fn move_back_cursor(&mut self, cursor: &mut MemDBCheckpoint, hdr: &MemDBVlogHdr) {
+        cursor.offset_in_block -= MEMDB_VLOG_HDR_SIZE + hdr.value_len as usize;
+        if cursor.offset_in_block == 0 {
+            cursor.blocks -= 1;
+            if cursor.blocks > 0 {
+                cursor.offset_in_block = self.mem_arena.blocks[cursor.blocks - 1].length;
+            }
+        }
     }
 }
 
@@ -511,14 +510,14 @@ impl NodeAllocator {
         }
     }
 
-    fn get_node(&mut self, addr: MemDBArenaAddr) -> *mut MemDBNode {
+    fn get_node(&mut self, addr: MemDBArenaAddr) -> MemDBNode {
         if addr.is_null() {
-            let raw_ptr: *mut MemDBNode = &mut self.null_node;
-            return raw_ptr;
+            return MemDBNode::new();
         }
         let block: &MemDBArenaBlock = self.mem_arena.blocks.get(addr.idx as usize).unwrap();
         unsafe {
-            block.membuf.buf.add(addr.off as usize) as *mut MemDBNode
+            let node_ptr = block.membuf.buf.add(addr.off as usize) as *const MemDBNode;
+            (*node_ptr)
         }
     }
 }
@@ -595,12 +594,12 @@ impl MemDB {
         }
 
         self.lock.lock();
-        let cp = self.stages.get(h - 1).unwrap();
+        let cp = self.stages.get(h - 1).unwrap().clone();
         if !self.vlog_invalid {
             let curr = self.vlog.checkpoint();
-            if !curr.is_same_position(cp) {
-                self.vlog.revert_to_checkpoint(self, cp);
-                self.vlog.mem_arena.truncate(cp);
+            if !curr.is_same_position(&cp) {
+                self.revert_to_checkpoint(&cp);
+                self.truncate(&cp);
             }
         }
         self.stages.pop();
@@ -608,6 +607,42 @@ impl MemDB {
 
     fn get_node(&mut self, x: MemDBArenaAddr) -> MemDBNodeAddr {
         MemDBNodeAddr::new(self.allocator.get_node(x), x)
+    }
+
+    /// TODO.
+    fn revert_to_checkpoint(&mut self, cp: &MemDBCheckpoint) {
+        let mut cursor = self.vlog.checkpoint();
+        while !cp.is_same_position(&cursor) {
+            let hdr_off = cursor.offset_in_block - MEMDB_VLOG_HDR_SIZE;
+            let block = self.vlog.mem_arena.blocks.get(cursor.blocks - 1).unwrap();
+            let mut hdr = MemDBVlogHdr::new();
+            unsafe {
+                hdr.load(core::slice::from_raw_parts(
+                    block.membuf.buf.add(hdr_off),
+                    MEMDB_VLOG_HDR_SIZE,
+                ));
+            }
+            let mut node = self.get_node(hdr.node_addr);
+            node.node.vptr = hdr.old_value;
+            self.size -= hdr.value_len as i32;
+            if hdr.old_value.is_null() {
+                // TODO, process key flags.
+            } else {
+                self.size += self.vlog.get_value(hdr.old_value).unwrap().len() as i32;
+            }
+
+            self.vlog.move_back_cursor(&mut cursor, &hdr);
+        }
+    }
+
+    /// Revert to the snapshot memory usage status.
+    fn truncate(&mut self, snap: &MemDBCheckpoint) {
+        assert!(snap.blocks <= self.vlog.mem_arena.blocks.len());
+        self.vlog.mem_arena.blocks.truncate(snap.blocks);
+        if self.vlog.mem_arena.blocks.len() > 0 {
+            self.vlog.mem_arena.blocks.last_mut().unwrap().length = snap.offset_in_block;
+        }
+        self.vlog.mem_arena.block_size = snap.block_size;
     }
 }
 
@@ -634,20 +669,20 @@ mod tests {
     fn test_mem_arena_block() {
         let block_size = 128;
         let mut mem_arena_block = MemDBArenaBlock::new(block_size);
-        assert_eq!(mem_arena_block.membuf.capacity, block_size);
+        assert_eq!(mem_arena_block.membuf.len, block_size);
 
         // Test alloc.
         let (offset, alloc_res) = mem_arena_block.alloc(15, true);
         assert_eq!(offset, 0);
         assert_eq!(mem_arena_block.length, 15);
         let mem_addr = alloc_res.unwrap();
-        assert_eq!(mem_addr.capacity, 15);
+        assert_eq!(mem_addr.len, 15);
         assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf);
         let (offset, alloc_res) = mem_arena_block.alloc(32, true);
         assert_eq!(offset, 16);
         assert_eq!(mem_arena_block.length, 48);
         let mem_addr = alloc_res.unwrap();
-        assert_eq!(mem_addr.capacity, 32);
+        assert_eq!(mem_addr.len, 32);
         unsafe {
             assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(16));
         }
@@ -655,7 +690,7 @@ mod tests {
         assert_eq!(offset, 48);
         assert_eq!(mem_arena_block.length, 77);
         let mem_addr = alloc_res.unwrap();
-        assert_eq!(mem_addr.capacity, 29);
+        assert_eq!(mem_addr.len, 29);
         unsafe {
             assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(48));
         }
@@ -670,7 +705,7 @@ mod tests {
         assert_eq!(offset, 80);
         assert_eq!(mem_arena_block.length, 85);
         let mem_addr = alloc_res.unwrap();
-        assert_eq!(mem_addr.capacity, 5);
+        assert_eq!(mem_addr.len, 5);
         unsafe {
             assert_eq!(mem_addr.buf, mem_arena_block.membuf.buf.add(80));
         }
